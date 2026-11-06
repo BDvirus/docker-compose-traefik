@@ -1,52 +1,100 @@
-version: '3'
+# Deployed by Komodo behind a shared, already-running Traefik reverse
+# proxy (websecure entrypoint). No service publishes host
+# ports; Traefik reaches app/api over the external `network-proxy` network
+# and MariaDB is only on the internal `backend` network.
+#
+# Required environment (set in the Komodo stack, secrets as [[VARIABLES]]):
+#   APP_HOST          e.g. app.example.com
+#   DB_PASSWORD       MariaDB app-user password
+#   DB_ROOT_PASSWORD  MariaDB root password
+#   APP_KEY           Laravel key, "base64:<32 random bytes, base64>"
+
 services:
   app:
     build:
-      context: ./dockerfiles
-      dockerfile: javascript.dockerfile
-    ports:
-      - "8081:8081"
-    volumes:
-      - ./frontend:/var/www/html
+      context: ./frontend
+      dockerfile: ../dockerfiles/javascript.dockerfile
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - network-proxy
     labels:
-      - "traefik.http.routers.site.rule=Host(`app.localhost`)"
+      traefik.enable: "true"
+      traefik.docker.network: network-proxy
+      traefik.http.routers.tdemo-app.rule: Host(`${APP_HOST:?APP_HOST is required}`)
+      traefik.http.routers.tdemo-app.entrypoints: websecure
+      traefik.http.routers.tdemo-app.tls: "true"
+      traefik.http.routers.tdemo-app.middlewares: security-headers@file
+      traefik.http.services.tdemo-app.loadbalancer.server.port: "8081"
     depends_on:
-      - traefik
       - api
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: ../dockerfiles/php.dockerfile
+    restart: unless-stopped
+    environment:
+      APP_NAME: tdemo
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_KEY: ${APP_KEY:?APP_KEY is required}
+      APP_URL: https://${APP_HOST}
+      LOG_CHANNEL: stderr
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: laravel
+      DB_USERNAME: laravel
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - network-proxy
+      - backend
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: network-proxy
+      traefik.http.routers.tdemo-api.rule: Host(`${APP_HOST}`) && PathPrefix(`/api`)
+      traefik.http.routers.tdemo-api.entrypoints: websecure
+      traefik.http.routers.tdemo-api.tls: "true"
+      traefik.http.routers.tdemo-api.middlewares: security-headers@file
+      traefik.http.services.tdemo-api.loadbalancer.server.port: "8082"
+    depends_on:
+      mysql:
+        condition: service_healthy
 
   mysql:
     image: mariadb:10.6
     restart: unless-stopped
-    tty: true
-    ports:
-      - "3306:3306"
     environment:
-      MYSQL_DATABASE: laravel
-      MYSQL_USER: laravel
-      MYSQL_PASSWORD: secret
-      MYSQL_ROOT_PASSWORD: secret
-      SERVICE_TAGS: dev
-      SERVICE_NAME: mysql
-
-  api:
-    build:
-      context: ./dockerfiles
-      dockerfile: php.dockerfile
-    ports:
-      - "8082:8082"
+      MARIADB_DATABASE: laravel
+      MARIADB_USER: laravel
+      MARIADB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required}
     volumes:
-      - ./backend:/var/www/html
-    labels:
-      - "traefik.http.routers.api.rule=(Host(`app.localhost`) && PathPrefix(`/api`))"
-    depends_on:
-      - traefik
-      - mysql
+      - mysql-data:/var/lib/mysql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
-  traefik:
-    image: traefik:v2.9
-    command: --api.insecure=true --providers.docker
-    ports:
-      - "80:80"
-      - "8080:8080"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+networks:
+  network-proxy:
+    name: network-proxy
+    external: true
+  # App <-> database only; no route out.
+  backend:
+    internal: true
+
+volumes:
+  mysql-data: {}
